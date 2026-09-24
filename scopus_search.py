@@ -1,6 +1,7 @@
 """Busca un DOI en la API oficial de Scopus sin exponer la clave en la URL."""
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -54,10 +55,18 @@ def get_api_key():
 def search_doi(doi, api_key, open_url=None):
     if not DOI_PATTERN.fullmatch(doi):
         raise ValueError("El DOI debe tener formato 10.xxxx/sufijo, sin espacios ni comillas.")
+    return search_query(f'DOI("{doi}")', api_key, count=1, open_url=open_url)
+
+
+def search_query(query, api_key, count=10, start=0, open_url=None):
+    if not query.strip() or len(query) > 1000:
+        raise ValueError("La consulta debe tener entre 1 y 1000 caracteres.")
+    if not 1 <= count <= 25 or start < 0:
+        raise ValueError("count debe estar entre 1 y 25 y start no puede ser negativo.")
     if not api_key or "\n" in api_key or "\r" in api_key:
         raise ScopusError("La clave API no es válida.")
 
-    url = ENDPOINT + "?" + urlencode({"query": f'DOI("{doi}")', "count": 1})
+    url = ENDPOINT + "?" + urlencode({"query": query, "count": count, "start": start})
     request = Request(url, headers={"Accept": "application/json", "X-ELS-APIKey": api_key})
     if open_url is None:
         open_url = build_opener(NoRedirect()).open
@@ -82,28 +91,74 @@ def search_doi(doi, api_key, open_url=None):
     return [item for item in results.get("entry", []) if isinstance(item, dict) and item.get("dc:title")]
 
 
+def export_csv(entries, output):
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    columns = {
+        "dc:title": "titulo",
+        "dc:creator": "autor",
+        "prism:doi": "doi",
+        "prism:publicationName": "fuente",
+        "prism:coverDate": "fecha",
+        "subtypeDescription": "tipo",
+        "citedby-count": "citas",
+    }
+
+    def safe_cell(value):
+        text = str(value or "")
+        return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
+
+    with output.open("x", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(columns.values()))
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow({label: safe_cell(entry.get(field)) for field, label in columns.items()})
+
+
 def main():
     parser = argparse.ArgumentParser(description="Busca un DOI en Scopus.")
     parser.add_argument("doi", nargs="?", help="Por ejemplo: 10.1145/3695988")
     parser.add_argument("--save-key", action="store_true", help="Guarda la clave en un archivo privado para Hermes")
+    parser.add_argument("--query", help="Consulta avanzada de Scopus, por ejemplo TITLE-ABS-KEY(software)")
+    parser.add_argument("--limit", type=int, default=25, help="Máximo de resultados para --query (1-100)")
+    parser.add_argument("--csv", type=Path, help="Guarda metadatos en un CSV nuevo; no sobrescribe archivos")
     args = parser.parse_args()
     if args.save_key:
-        if args.doi:
-            parser.error("--save-key no acepta un DOI")
+        if args.doi or args.query or args.csv:
+            parser.error("--save-key no se combina con búsquedas o exportación")
         try:
             store_api_key(getpass("Pega tu clave API (no se mostrará): ").strip())
         except ScopusError as error:
             parser.exit(1, f"Error: {error}\n")
         print("Clave guardada en un archivo privado (permisos 600).")
         return
-    if not args.doi:
-        parser.error("indica un DOI")
+    if bool(args.doi) == bool(args.query):
+        parser.error("indica un DOI o --query, pero no ambos")
+    if not 1 <= args.limit <= 100:
+        parser.error("--limit debe estar entre 1 y 100")
     try:
-        entries = search_doi(args.doi, get_api_key())
+        key = get_api_key()
+        if args.query:
+            entries = []
+            while len(entries) < args.limit:
+                count = min(25, args.limit - len(entries))
+                page = search_query(args.query, key, count=count, start=len(entries))
+                entries.extend(page)
+                if len(page) < count:
+                    break
+        else:
+            entries = search_doi(args.doi, key)
+        if args.csv:
+            export_csv(entries, args.csv)
     except (ScopusError, ValueError) as error:
         parser.exit(1, f"Error: {error}\n")
+    except FileExistsError:
+        parser.exit(1, "Error: el CSV ya existe; elige otro nombre para no sobrescribirlo.\n")
+    if args.csv:
+        print(f"Guardados {len(entries)} resultados en {args.csv}")
+        return
     if not entries:
-        print("No se encontró ese DOI en la respuesta de Scopus.")
+        print("No se encontraron resultados en la respuesta de Scopus.")
         return
     for entry in entries:
         print("Título:", entry.get("dc:title", "—"))
@@ -111,6 +166,7 @@ def main():
         print("Fuente:", entry.get("prism:publicationName", "—"))
         print("Fecha:", entry.get("prism:coverDate", "—"))
         print("Tipo:", entry.get("subtypeDescription", "—"))
+        print()
 
 
 if __name__ == "__main__":
