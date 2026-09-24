@@ -1,5 +1,8 @@
 import io
 import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -56,10 +59,31 @@ class ScopusSearchTests(unittest.TestCase):
         self.assertNotIn("test-key", str(raised.exception))
 
     def test_missing_key_prompts_without_echo(self):
-        with patch.dict("scopus_search.os.environ", {}, clear=True):
-            with patch("scopus_search.getpass", return_value="test-key") as ask:
-                self.assertEqual(scopus_search.get_api_key(), "test-key")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(scopus_search, "KEY_FILE", Path(temporary) / "absent"):
+                with patch.dict("scopus_search.os.environ", {}, clear=True):
+                    with patch("scopus_search.getpass", return_value="test-key") as ask:
+                        self.assertEqual(scopus_search.get_api_key(), "test-key")
         ask.assert_called_once()
+
+    def test_stored_key_is_private_and_available_without_prompt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "private" / "scopus_api_key"
+            scopus_search.store_api_key("test-key", key_file)
+            self.assertEqual(os.stat(key_file).st_mode & 0o777, 0o600)
+            with patch.object(scopus_search, "KEY_FILE", key_file):
+                with patch.dict("scopus_search.os.environ", {}, clear=True):
+                    with patch("scopus_search.getpass") as ask:
+                        self.assertEqual(scopus_search.get_api_key(), "test-key")
+                        ask.assert_not_called()
+
+    def test_store_key_refuses_to_replace_existing_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "scopus_api_key"
+            scopus_search.store_api_key("first-key", key_file)
+            with self.assertRaises(scopus_search.ScopusError):
+                scopus_search.store_api_key("second-key", key_file)
+            self.assertEqual(key_file.read_text(), "first-key\n")
 
 
 if __name__ == "__main__":
